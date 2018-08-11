@@ -3,22 +3,20 @@
 
 using System;
 using System.Linq;
-using System.Reactive.Disposables;
 using Avalonia.Controls.Generators;
+using Avalonia.Controls.Platform;
 using Avalonia.Controls.Primitives;
 using Avalonia.Controls.Templates;
 using Avalonia.Input;
-using Avalonia.Input.Raw;
 using Avalonia.Interactivity;
 using Avalonia.LogicalTree;
-using Avalonia.Rendering;
 
 namespace Avalonia.Controls
 {
     /// <summary>
     /// A top-level menu control.
     /// </summary>
-    public class Menu : SelectingItemsControl, IFocusScope, IMainMenu
+    public class Menu : SelectingItemsControl, IFocusScope, IMainMenu, IMenu
     {
         /// <summary>
         /// Defines the default items panel used by a <see cref="Menu"/>.
@@ -34,12 +32,28 @@ namespace Avalonia.Controls
                 nameof(IsOpen),
                 o => o.IsOpen);
 
+        private readonly IMenuInteractionHandler _interaction;
         private bool _isOpen;
 
         /// <summary>
-        /// Tracks event handlers added to the root of the visual tree.
+        /// Initializes a new instance of the <see cref="Menu"/> class.
         /// </summary>
-        private IDisposable _subscription;
+        public Menu()
+        {
+            _interaction = AvaloniaLocator.Current.GetService<IMenuInteractionHandler>() ?? 
+                new DefaultMenuInteractionHandler();
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Menu"/> class.
+        /// </summary>
+        /// <param name="interactionHandler">The menu iteraction handler.</param>
+        public Menu(IMenuInteractionHandler interactionHandler)
+        {
+            Contract.Requires<ArgumentNullException>(interactionHandler != null);
+
+            _interaction = interactionHandler;
+        }
 
         /// <summary>
         /// Initializes static members of the <see cref="Menu"/> class.
@@ -47,7 +61,6 @@ namespace Avalonia.Controls
         static Menu()
         {
             ItemsPanelProperty.OverrideDefaultValue(typeof(Menu), DefaultPanel);
-            MenuItem.ClickEvent.AddClassHandler<Menu>(x => x.OnMenuClick, handledEventsToo: true);
             MenuItem.SubmenuOpenedEvent.AddClassHandler<Menu>(x => x.OnSubmenuOpened);
         }
 
@@ -60,17 +73,22 @@ namespace Avalonia.Controls
             private set { SetAndRaise(IsOpenProperty, ref _isOpen, value); }
         }
 
-        /// <summary>
-        /// Gets the selected <see cref="MenuItem"/> container.
-        /// </summary>
-        private MenuItem SelectedMenuItem
+        /// <inheritdoc/>
+        IMenuInteractionHandler IMenu.InteractionHandler => _interaction;
+
+        /// <inheritdoc/>
+        IMenuItem IMenuElement.SelectedItem
         {
             get
             {
                 var index = SelectedIndex;
                 return (index != -1) ?
-                    (MenuItem)ItemContainerGenerator.ContainerFromIndex(index) :
+                    (IMenuItem)ItemContainerGenerator.ContainerFromIndex(index) :
                     null;
+            }
+            set
+            {
+                SelectedIndex = ItemContainerGenerator.IndexFromContainer(value);
             }
         }
 
@@ -93,50 +111,12 @@ namespace Avalonia.Controls
         /// </summary>
         public void Open()
         {
-            SelectedIndex = 0;
-            SelectedMenuItem.Focus();
             IsOpen = true;
+            _interaction.MenuOpened(this);
         }
 
         /// <inheritdoc/>
-        protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
-        {
-            base.OnAttachedToVisualTree(e);
-
-            var topLevel = (TopLevel)e.Root;
-            var window = e.Root as Window;
-
-            if (window != null)
-                window.Deactivated += Deactivated;
-
-            var pointerPress = topLevel.AddHandler(
-                PointerPressedEvent,
-                TopLevelPreviewPointerPress,
-                RoutingStrategies.Tunnel);
-
-            _subscription = new CompositeDisposable(
-                pointerPress,
-                Disposable.Create(() =>
-                {
-                    if (window != null)
-                        window.Deactivated -= Deactivated;
-                }),
-                InputManager.Instance.Process.Subscribe(ListenForNonClientClick));
-
-            var inputRoot = e.Root as IInputRoot;
-
-            if (inputRoot?.AccessKeyHandler != null)
-            {
-                inputRoot.AccessKeyHandler.MainMenu = this;
-            }
-        }
-
-        /// <inheritdoc/>
-        protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
-        {
-            base.OnDetachedFromVisualTree(e);
-            _subscription.Dispose();
-        }
+        bool IMenuElement.MoveSelection(NavigationDirection direction, bool wrap) => MoveSelection(direction, wrap);
 
         /// <inheritdoc/>
         protected override IItemContainerGenerator CreateItemContainerGenerator()
@@ -144,27 +124,63 @@ namespace Avalonia.Controls
             return new ItemContainerGenerator<MenuItem>(this, MenuItem.HeaderProperty, null);
         }
 
-        /// <summary>
-        /// Called when a key is pressed within the menu.
-        /// </summary>
-        /// <param name="e">The event args.</param>
+        /// <inheritdoc/>
+        protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
+        {
+            base.OnAttachedToVisualTree(e);
+
+            var inputRoot = e.Root as IInputRoot;
+
+            if (inputRoot?.AccessKeyHandler != null)
+            {
+                inputRoot.AccessKeyHandler.MainMenu = this;
+            }
+
+            _interaction.Attach(this);
+        }
+
+        /// <inheritdoc/>
+        protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+        {
+            base.OnDetachedFromVisualTree(e);
+            _interaction.Detach();
+        }
+
+        /// <inheritdoc/>
+        protected override void OnGotFocus(GotFocusEventArgs e)
+        {
+            base.OnGotFocus(e);
+            e.Handled = UpdateSelectionFromEventSource(e.Source, true);
+        }
+
+        /// <inheritdoc/>
         protected override void OnKeyDown(KeyEventArgs e)
         {
-            bool menuWasOpen = SelectedMenuItem?.IsSubMenuOpen ?? false;
-
-            base.OnKeyDown(e);
-
-            if (menuWasOpen)
+            if (e.Source is MenuItem item)
             {
-                // If a menu item was open and we navigate to a new one with the arrow keys, open
-                // that menu and select the first item.
-                var selection = SelectedMenuItem;
+                _interaction.KeyDownEvent(item, e);
+            }
+        }
 
-                if (selection != null && !selection.IsSubMenuOpen)
-                {
-                    selection.IsSubMenuOpen = true;
-                    selection.SelectedIndex = 0;
-                }
+        /// <inheritdoc/>
+        protected override void OnPointerPressed(PointerPressedEventArgs e)
+        {
+            var item = GetMenuItem(e.Source as IControl);
+
+            if (item != null)
+            {
+                _interaction.PointerEvent(item, e);
+            }
+        }
+
+        /// <inheritdoc/>
+        protected override void OnPointerReleased(PointerReleasedEventArgs e)
+        {
+            var item = GetMenuItem(e.Source as IControl);
+
+            if (item != null)
+            {
+                _interaction.PointerEvent(item, e);
             }
         }
 
@@ -175,7 +191,11 @@ namespace Avalonia.Controls
         protected override void OnLostFocus(RoutedEventArgs e)
         {
             base.OnLostFocus(e);
-            SelectedItem = null;
+
+            if (e.Source == this)
+            {
+                SelectedItem = null;
+            }
         }
 
         /// <summary>
@@ -184,9 +204,7 @@ namespace Avalonia.Controls
         /// <param name="e">The event args.</param>
         protected virtual void OnSubmenuOpened(RoutedEventArgs e)
         {
-            var menuItem = e.Source as MenuItem;
-
-            if (menuItem != null && menuItem.Parent == this)
+            if (e.Source is MenuItem menuItem && menuItem.Parent == this)
             {
                 foreach (var child in this.GetLogicalChildren().OfType<MenuItem>())
                 {
@@ -200,56 +218,13 @@ namespace Avalonia.Controls
             IsOpen = true;
         }
 
-        /// <summary>
-        /// Called when the top-level window is deactivated.
-        /// </summary>
-        /// <param name="sender">The sender.</param>
-        /// <param name="e">The event args.</param>
-        private void Deactivated(object sender, EventArgs e)
+        private IMenuItem GetMenuItem(IControl item)
         {
-            Close();
-        }
-
-        /// <summary>
-        /// Listens for non-client clicks and closes the menu when one is detected.
-        /// </summary>
-        /// <param name="e">The raw event.</param>
-        private void ListenForNonClientClick(RawInputEventArgs e)
-        {
-            var mouse = e as RawMouseEventArgs;
-
-            if (mouse?.Type == RawMouseEventType.NonClientLeftButtonDown)
+            while (true)
             {
-                Close();
-            }
-        }
-
-        /// <summary>
-        /// Called when a submenu is clicked somewhere in the menu.
-        /// </summary>
-        /// <param name="e">The event args.</param>
-        private void OnMenuClick(RoutedEventArgs e)
-        {
-            Close();
-            FocusManager.Instance.Focus(null);
-            e.Handled = true;
-        }
-
-        /// <summary>
-        /// Called when the pointer is pressed anywhere on the window.
-        /// </summary>
-        /// <param name="sender">The sender.</param>
-        /// <param name="e">The event args.</param>
-        private void TopLevelPreviewPointerPress(object sender, PointerPressedEventArgs e)
-        {
-            if (IsOpen)
-            {
-                var control = e.Source as ILogical;
-
-                if (!this.IsLogicalParentOf(control))
-                {
-                    Close();
-                }
+                if (item == null) return null;
+                if (item is IMenuItem menuItem) return menuItem;
+                item = item.Parent;
             }
         }
     }
